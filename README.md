@@ -72,15 +72,6 @@ code. You may not use it for the parts being evaluated. Those are yours:
 - writing `NOTES.md`;
 - the discussion afterward.
 
-Before you start, load the supplied rules into your assistant and show the interviewer that
-it has picked them up:
-
-| Assistant | Rules location |
-|---|---|
-| Claude Code | `CLAUDE.md` and `.claude/settings.json` are already in this folder; start it here |
-| Codex, Cursor, and others that read `AGENTS.md` | `AGENTS.md` is already in this folder |
-| Anything else | paste `AGENTS.md` as the first message or the system prompt |
-
 Direct the assistant the way you would direct a fast pair who types for you. Tell it the
 design in your own words ("one lock per wall; copy pixels and version under it; serialize
 after unlocking") and it will implement it. Run the grader yourself in your own terminal.
@@ -564,18 +555,14 @@ establishes the order of concurrent updates and how a snapshot remains internall
 
 ## Run the grader
 
-The grader is a prebuilt program in `grader/bin/`; pick the binary for your machine. It is the
-same for every stack. Its source is in `grader/` if you want to read exactly what it checks.
-Start your server, then:
+The grader is a prebuilt program that the interviewer supplies. It is the same for every stack.
+Start your server, then point the grader at it:
 
 ```sh
-grader/bin/firefly-grader-darwin-arm64 --url http://127.0.0.1:8765 --correctness-only
-grader/bin/firefly-grader-darwin-arm64 --url http://127.0.0.1:8765 --runs 1   # quick speed check
-grader/bin/firefly-grader-darwin-arm64 --url http://127.0.0.1:8765            # scored: 30 runs
+firefly-grader --url http://127.0.0.1:8765 --correctness-only
+firefly-grader --url http://127.0.0.1:8765 --runs 1   # quick speed check
+firefly-grader --url http://127.0.0.1:8765            # scored: 30 runs
 ```
-
-Other binaries: `-darwin-amd64`, `-linux-amd64`, `-linux-arm64`, `-windows-amd64.exe`. On macOS,
-if Gatekeeper blocks the binary, run `xattr -d com.apple.quarantine grader/bin/*` once.
 
 The grader creates fresh IDs on every run. It tests exact output, validation, creation races,
 concurrent snapshots, and final-state correctness. Failures produce a named check and diagnostic.
@@ -598,14 +585,6 @@ also shows each run's points, the standard deviation, and the per-workload avera
 that keeps up finishes in about 4 minutes; one that falls behind takes longer. Use `--runs 1`
 while you iterate. `--rate`, `--duration`, `--connections`, `--p99-target-ms`, and `--runs`
 change the load; the interviewer scores with the defaults.
-
-To see a wall, render any snapshot as a picture (the renderer needs Python 3; your server does
-not):
-
-```sh
-curl -s http://127.0.0.1:8765/walls/demo | python3 visualize_wall.py - -o demo.png
-python3 visualize_wall.py --url http://127.0.0.1:8765 --wall demo --crop 0,0,8,8 --scale 40
-```
 
 Submit your source, the assistant transcript, and `NOTES.md` written by you: the startup command,
 dependencies, why you chose your stack, synchronization, the observed bottleneck, one
