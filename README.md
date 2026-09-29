@@ -1,5 +1,26 @@
 # Firefly Concert — a concurrent light-wall server
 
+![A 64 by 64 wall read at version 1, 25, and 400, rendered as a heat map of energy per cell](docs/images/full-wall.png)
+
+*One wall, read three times. Every burst adds energy to a rectangle of cells. Every read returns
+all 4,096 cells and the version they belong to.*
+
+## Contents
+
+- [Your task](#your-task)
+- [Your choice of stack is part of the problem](#your-choice-of-stack-is-part-of-the-problem)
+- [AI assistance: coding only](#ai-assistance-coding-only)
+- [The model](#the-model)
+- [How to run your submission](#how-to-run-your-submission)
+- [HTTP conventions](#http-conventions)
+- [Endpoints](#endpoints)
+  - [1. Create a wall](#1-create-a-wall)
+  - [2. Add a burst](#2-add-a-burst)
+  - [3. Read a snapshot](#3-read-a-snapshot)
+- [Worked example with exact values](#worked-example-with-exact-values)
+- [Suggested implementation milestones](#suggested-implementation-milestones)
+- [Run the grader](#run-the-grader)
+
 ## Your task
 
 Imagine a concert where audience members tap their phones to send rectangular bursts of light
@@ -77,6 +98,49 @@ against the submission even when the code scores well.
 - Walls are independent. Updating one must not change any other.
 - The grader keeps all pixel values and versions below 2^31.
 
+### Coordinates and pixel indexing
+
+![The whole 64 by 64 wall with its four corners labelled, next to a zoom of the top-left 8 by 8 cells showing each cell's pixel index](docs/images/coordinates.png)
+
+```text
+Wall:    64 columns (x = 0..63) by 64 rows (y = 0..63)  =  4,096 cells
+Origin:  (0,0) is the top-left cell. x grows to the right, y grows downward.
+
+pixels[index]    where    index = y * 64 + x
+
+(x=0,  y=0)   -> pixels[0]        top-left
+(x=63, y=0)   -> pixels[63]       top-right
+(x=0,  y=63)  -> pixels[4032]     bottom-left
+(x=63, y=63)  -> pixels[4095]     bottom-right
+(x=2,  y=3)   -> pixels[194]      3 * 64 + 2
+```
+
+### What a burst does
+
+A burst names a rectangle by its top-left corner `(x, y)`, its `width`, its `height`, and an
+`energy`. The server adds `energy` to every cell inside that rectangle and raises the wall's
+version by one.
+
+![Two overlapping bursts on the top-left 8 by 8 cells; cells covered by both hold the sum of both energies](docs/images/overlapping-bursts.png)
+
+```text
+Burst A:  {"x":1,"y":1,"width":4,"height":3,"energy":10}    -> version 1
+Burst B:  {"x":3,"y":2,"width":4,"height":3,"energy":3}     -> version 2
+
+A burst covers every cell where   x <= cell_x < x + width   and   y <= cell_y < y + height
+
+After A                            After A and B
+   x:  0  1  2  3  4  5  6  7         x:  0  1  2  3  4  5  6  7
+y=0    0  0  0  0  0  0  0  0      y=0    0  0  0  0  0  0  0  0
+y=1    0 10 10 10 10  0  0  0      y=1    0 10 10 10 10  0  0  0
+y=2    0 10 10 10 10  0  0  0      y=2    0 10 10 13 13  3  3  0
+y=3    0 10 10 10 10  0  0  0      y=3    0 10 10 13 13  3  3  0
+y=4    0  0  0  0  0  0  0  0      y=4    0  0  0  3  3  3  3  0
+y=5    0  0  0  0  0  0  0  0      y=5    0  0  0  0  0  0  0  0
+```
+
+Values simply add. Cells inside both rectangles hold 10 + 3 = 13. Nothing wraps or saturates.
+
 ## How to run your submission
 
 Provide your startup command. It must accept the port as an argument, for example:
@@ -85,105 +149,371 @@ Provide your startup command. It must accept the port as an argument, for exampl
 <your start command> --port 8765
 ```
 
-Listen on `127.0.0.1` at the specified port. Support HTTP/1.1 persistent connections or later.
-Return `Content-Type: application/json` and correctly frame each response (Content-Length or
-chunked encoding). JSON whitespace and object-key order do not matter. Return the exact fields
-listed below; do not wrap responses in additional objects.
+## HTTP conventions
 
-## API: three endpoints
+These rules apply to every endpoint.
 
-### Create: `POST /walls`
+| Rule | Requirement |
+|---|---|
+| Bind address | `127.0.0.1`, on the port given on the command line |
+| Protocol | HTTP/1.1 with persistent (keep-alive) connections, or later |
+| Response `Content-Type` | `application/json` on every response, including errors |
+| Response framing | Every response is correctly framed with `Content-Length` or chunked encoding |
+| Request bodies | UTF-8 JSON. The grader always sends a valid `Content-Length` header |
+| JSON formatting | Whitespace and object-key order do not matter |
+| Response shape | Exactly the fields listed for the endpoint, at the top level. Never wrap a response in another object |
+| Unknown request fields | Ignored |
+| State | Held in memory in one server process. Restarting the server clears every wall |
 
-Body:
+Out of scope, and never sent by the grader: methods other than the ones listed below, query
+parameters, percent-encoded path characters, HTTP pipelining, chunked request bodies, and
+bodies larger than 8 KiB.
+
+## Endpoints
+
+Implement exactly three routes.
+
+| # | Method | Path | Purpose | Success status |
+|---|---|---|---|---|
+| 1 | `POST` | `/walls` | Create an empty wall | 201 |
+| 2 | `POST` | `/walls/{wall_id}/bursts` | Add energy to a rectangle of one wall | 200 |
+| 3 | `GET` | `/walls/{wall_id}` | Read a consistent snapshot of one wall | 200 |
+
+### Wall IDs
+
+```text
+wall_id:   1 to 64 characters, each one of   A-Z   a-z   0-9   _   -
+regex:     ^[A-Za-z0-9_-]{1,64}$
+
+valid:     main-stage    stage_2    abc    MAIN    x
+invalid:   ""  (empty)      "main stage"  (space)      "stage/2"  (slash)      65+ characters
+```
+
+The same alphabet applies whether the ID appears in a JSON body or as `{wall_id}` in a path.
+A path ID outside the alphabet can never name an existing wall, so it falls under the 404 rule
+below.
+
+### Error responses
+
+Every error body is a JSON object with one field, `error`.
+
+| Status | Body | Returned when |
+|---|---|---|
+| 404 | `{"error":"not_found"}` | The route is unknown, or `{wall_id}` in the path does not exist |
+| 400 | `{"error":"invalid_request"}` | The body is not valid JSON, is not an object, is missing a required field, has a field of the wrong type or out of range, or describes a rectangle that does not fit |
+| 409 | `{"error":"already_exists"}` | A valid create request names a wall that already exists |
+
+When more than one rule applies, use this order:
+
+```text
+1. 404 first     Nonexistent wall or unknown route. Wins even when the body is malformed.
+2. 400 second    Validate the body only after the route and the wall resolve.
+3. 409 last      A create request conflicts only after its body passes validation.
+```
+
+A rejected request must leave every wall's pixels and version unchanged.
+
+### Numeric fields
+
+```text
+Every required numeric field must be a JSON integer token.
+
+valid:      1
+invalid:    1.0    1e0    true    null    "1"        -> 400 invalid_request
+
+Missing required field   -> 400 invalid_request
+Unknown extra field      -> ignored, no error
+```
+
+Valid JSON has no NaN or Infinity tokens, so you never need to handle them.
+
+### 1. Create a wall
+
+**Route**
+
+```text
+POST /walls
+```
+
+**Request body**
 
 ```json
 {"wall_id":"main-stage"}
 ```
 
-`wall_id` must be a string of 1–64 characters matching `[A-Za-z0-9_-]+`.
+| Field | Type | Required | Constraint |
+|---|---|---|---|
+| `wall_id` | string | yes | 1–64 characters matching `[A-Za-z0-9_-]+` |
 
-For a new ID, create an empty wall and return **201**:
+**Responses**
 
-```json
+| Status | Returned when | Body |
+|---|---|---|
+| 201 | The ID was free and the wall was created | `{"wall_id":"main-stage","version":0}` |
+| 409 | The ID already exists | `{"error":"already_exists"}` |
+| 400 | The body is invalid | `{"error":"invalid_request"}` |
+
+**Fields in the 201 body**
+
+| Field | Type | Value |
+|---|---|---|
+| `wall_id` | string | The ID that was created |
+| `version` | integer | Always `0` for a new wall |
+
+**Full exchange**
+
+```http
+POST /walls HTTP/1.1
+Host: 127.0.0.1:8765
+Content-Type: application/json
+Content-Length: 24
+
+{"wall_id":"main-stage"}
+```
+
+```http
+HTTP/1.1 201 Created
+Content-Type: application/json
+Content-Length: 36
+
 {"wall_id":"main-stage","version":0}
 ```
 
-For an existing ID return **409**, without resetting the wall:
+The same request sent a second time:
 
-```json
+```http
+HTTP/1.1 409 Conflict
+Content-Type: application/json
+Content-Length: 26
+
 {"error":"already_exists"}
 ```
 
-If eight clients create the same ID concurrently, exactly one must get 201 and seven must get 409.
+**Behavior**
 
-### Update: `POST /walls/{wall_id}/bursts`
+- A new wall is a 64 × 64 grid with every cell at 0 and version 0.
+- A 409 must not reset or otherwise change the existing wall.
+- Creation must be atomic under concurrency. If eight clients create the same ID at the same
+  time, exactly one receives 201 and the other seven receive 409.
 
-Body:
+```text
+8 clients at the same instant:   POST /walls   {"wall_id":"main-stage"}
+
+client 1  -> 201  {"wall_id":"main-stage","version":0}
+client 2  -> 409  {"error":"already_exists"}
+client 3  -> 409  {"error":"already_exists"}
+   ...
+client 8  -> 409  {"error":"already_exists"}
+
+Exactly one 201. Never zero, never two.
+```
+
+### 2. Add a burst
+
+**Route**
+
+```text
+POST /walls/{wall_id}/bursts
+```
+
+| Path parameter | Constraint |
+|---|---|
+| `wall_id` | Must name an existing wall, otherwise 404 |
+
+**Request body**
 
 ```json
 {"x":2,"y":3,"width":2,"height":2,"energy":5}
 ```
 
-| Field | Required value |
-|---|---|
-| `x`, `y` | Integer from 0 through 63 |
-| `width`, `height` | Integer from 1 through 64 |
-| `energy` | Integer from 1 through 100 |
+| Field | Type | Required | Range | Meaning |
+|---|---|---|---|---|
+| `x` | integer | yes | 0 through 63 | Column of the rectangle's left edge |
+| `y` | integer | yes | 0 through 63 | Row of the rectangle's top edge |
+| `width` | integer | yes | 1 through 64 | Number of columns covered |
+| `height` | integer | yes | 1 through 64 | Number of rows covered |
+| `energy` | integer | yes | 1 through 100 | Amount added to every covered cell |
 
-All five fields are required. The rectangle must fit: `x + width <= 64` and
-`y + height <= 64`. Reject rectangles that extend beyond the wall; do not clip them.
+The rectangle must fit on the wall:
 
-Add `energy` to cells with `x <= cell_x < x + width` and `y <= cell_y < y + height`.
-The example updates exactly `(2,3)`, `(3,3)`, `(2,4)`, and `(3,4)`.
+```text
+x + width  <= 64
+y + height <= 64
+```
 
-Apply the whole burst and increment the version atomically. Return **200** with the version
-assigned to this specific update:
+Reject a rectangle that extends past the edge with 400. Do not clip it.
 
-```json
+![Left: a 4 by 4 burst at x=60,y=60 fits and is applied. Right: a 2 by 2 burst at x=63,y=63 crosses the wall edge and is rejected, leaving the wall unchanged](docs/images/out-of-bounds.png)
+
+**Responses**
+
+| Status | Returned when | Body |
+|---|---|---|
+| 200 | The burst was applied | `{"version":1}` |
+| 404 | `{wall_id}` does not exist. Checked before the body | `{"error":"not_found"}` |
+| 400 | A field is missing or invalid, or the rectangle does not fit | `{"error":"invalid_request"}` |
+
+**Fields in the 200 body**
+
+| Field | Type | Value |
+|---|---|---|
+| `version` | integer | The wall version assigned to this specific burst |
+
+**Full exchange**
+
+```http
+POST /walls/main-stage/bursts HTTP/1.1
+Host: 127.0.0.1:8765
+Content-Type: application/json
+Content-Length: 45
+
+{"x":2,"y":3,"width":2,"height":2,"energy":5}
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 13
+
 {"version":1}
 ```
 
-Repeated identical requests count as separate bursts. If N bursts succeed on a new wall, their
-returned versions must be exactly the integers 1 through N, each once. Response arrival order
-may differ from version order.
-
-### Read: `GET /walls/{wall_id}`
-
-Return **200** with a consistent snapshot:
+Rejected examples. Each one leaves the wall and its version untouched:
 
 ```text
-{"version": INTEGER, "pixels": ARRAY_OF_EXACTLY_4096_NONNEGATIVE_INTEGERS}
+{"x":63,"y":63,"width":2,"height":2,"energy":1}    -> 400   x + width = 65 > 64
+{"x":2,"y":3,"width":2.0,"height":2,"energy":5}    -> 400   2.0 is not an integer token
+{"x":2,"y":3,"width":2,"height":2}                 -> 400   energy is missing
+{"x":2,"y":3,"width":2,"height":2,"energy":0}      -> 400   energy below 1
+{"x":2,"y":3,"width":2,"height":2,"energy":101}    -> 400   energy above 100
+{"x":"2","y":3,"width":2,"height":2,"energy":5}    -> 400   "2" is a string
+not json at all                                    -> 400   body does not parse
+[1,2,3]                                            -> 400   body is not an object
+
+POST /walls/no-such-wall/bursts   with any body    -> 404   the wall check comes first
 ```
 
-`pixels` is row-major: index = `y * 64 + x`. Include all zero entries. It is a flat array,
-not 64 nested arrays. Never return a sparse map, image, encoded blob, or total energy instead.
+The 400 body is always the same:
 
-The version and all pixels must come from the same state. A concurrent snapshot may show a
-burst entirely before or entirely after it is applied, but never part of that burst. A read
-started after receiving a successful burst response must include that burst. Sequential reads
-on a client cannot move backward in version.
+```http
+HTTP/1.1 400 Bad Request
+Content-Type: application/json
+Content-Length: 27
 
-Different walls do not need a shared ordering. A simple per-wall lock is a valid starting point.
+{"error":"invalid_request"}
+```
 
-## Invalid requests and error precedence
+**Behavior**
 
-Inputs are UTF-8 JSON objects. Ignore extra object fields. Required numeric fields must be JSON
-integer tokens: `1` is valid; `1.0`, `1e0`, `true`, `null`, and `"1"` are invalid. There are no
-NaN/Infinity tokens in valid JSON. Wall-specific path IDs use the same valid ID alphabet above.
+- Add `energy` to every cell where `x <= cell_x < x + width` and `y <= cell_y < y + height`.
+  The example body updates exactly `(2,3)`, `(3,3)`, `(2,4)`, and `(3,4)`.
+- Values add without wrapping or saturation. The grader keeps all values below 2^31.
+- Apply the whole rectangle and increment the version as one atomic step.
+- The server assigns versions. Clients never send them.
+- Repeated identical requests are separate bursts, each with its own version.
+- If N bursts succeed on a new wall, the returned versions are exactly the integers 1 through
+  N, each once. Responses may arrive in a different order from the versions.
+- A burst on one wall never changes any other wall.
 
-For the specified routes, apply these rules in order:
+```text
+Three clients burst a fresh wall at the same time. Any assignment of 1, 2, 3 is correct,
+as long as each version is handed out exactly once:
 
-1. Unknown route or nonexistent wall: **404**, `{"error":"not_found"}`. For a nonexistent
-   wall this takes precedence even if the burst body is malformed.
-2. Malformed JSON, non-object body, missing field, invalid type/range, or rectangle out of bounds:
-   **400**, `{"error":"invalid_request"}`.
-3. Valid creation request with an existing ID: **409**, `{"error":"already_exists"}`.
+client A  -> 200  {"version":2}
+client B  -> 200  {"version":1}
+client C  -> 200  {"version":3}
+```
 
-Every rejected request must leave the state and version unchanged. Missing fields differ from
-extra fields: missing required fields are errors, while unknown fields are ignored.
-Methods other than the specified GET/POST routes, query parameters, encoded path characters,
-HTTP pipelining, chunked request bodies, and bodies larger than 8 KiB are outside the exercise.
-The grader sends valid Content-Length headers. Restarting the server clears all state.
+### 3. Read a snapshot
+
+**Route**
+
+```text
+GET /walls/{wall_id}
+```
+
+| Path parameter | Constraint |
+|---|---|
+| `wall_id` | Must name an existing wall, otherwise 404 |
+
+**Request body**
+
+None.
+
+**Responses**
+
+| Status | Returned when | Body |
+|---|---|---|
+| 200 | The wall exists | `{"version":2,"pixels":[0,0,…,0]}` with exactly 4,096 pixels |
+| 404 | `{wall_id}` does not exist | `{"error":"not_found"}` |
+
+**Fields in the 200 body**
+
+| Field | Type | Value |
+|---|---|---|
+| `version` | integer | The wall's current version |
+| `pixels` | array of exactly 4,096 non-negative integers | Every cell in row-major order: index = `y * 64 + x` |
+
+**Full exchange**
+
+```http
+GET /walls/main-stage HTTP/1.1
+Host: 127.0.0.1:8765
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 8216
+
+{"version":1,"pixels":[0,0,0,0, ... 4,096 integers in total ... ,0,0]}
+```
+
+A compact snapshot of an all-zero wall is 8,216 bytes. The load phase asks for about 2,500 of
+them per second, so the cost of building and sending this body is part of your score.
+
+Shape of the body for the wall above, after the one burst at `x=2 y=3 width=2 height=2`.
+Comments on the right are for reading only and are not part of the JSON:
+
+```text
+{
+  "version": 1,
+  "pixels": [
+    0, 0, 0, 0, ... 64 values ...,           row y=0    indices    0 ..   63
+    0, 0, 0, 0, ... 64 values ...,           row y=1    indices   64 ..  127
+    0, 0, 0, 0, ... 64 values ...,           row y=2    indices  128 ..  191
+    0, 0, 5, 5, 0, ... 60 more zeros ...,    row y=3    indices  192 ..  255    194 and 195 are 5
+    0, 0, 5, 5, 0, ... 60 more zeros ...,    row y=4    indices  256 ..  319    258 and 259 are 5
+    ...
+    0, 0, 0, 0, ... 64 values ...            row y=63   indices 4032 .. 4095
+  ]
+}
+```
+
+**Behavior**
+
+- `pixels` is one flat array that includes every zero. It is not 64 nested arrays, a sparse
+  map, an image, an encoded blob, or a total.
+- The version and all 4,096 pixels must come from the same state. A concurrent burst may
+  appear entirely applied or entirely absent, never partially.
+- A read that starts after a client receives a successful burst response must include that burst.
+- Sequential reads from one client must never see the version go backward.
+- Walls need no shared ordering with each other.
+- A simple per-wall lock is a valid starting point.
+
+![Three snapshots while a burst is in flight: one before the burst is allowed, one after the burst is allowed, and a torn snapshot with half the rectangle updated is never allowed](docs/images/snapshot-consistency.png)
+
+```text
+A burst of energy 6 on the rectangle x=2 y=2 width=4 height=4 is in flight.
+A snapshot taken at the same moment must be one of these two:
+
+ALLOWED    version 3, none of the 16 cells changed         the read landed before the burst
+ALLOWED    version 4, all 16 cells increased by 6          the read landed after the burst
+
+NEVER      some of the 16 cells changed and some not
+NEVER      version 4 but cells still missing the burst
+NEVER      version 3 but cells already showing the burst
+```
 
 ## Worked example with exact values
 
@@ -197,6 +527,22 @@ For a fresh wall `demo`:
 | 4 | `GET /walls/demo` | 200, version 2, exactly the pixels below |
 | 5 | Burst `{"x":63,"y":63,"width":2,"height":2,"energy":1}` | 400, `{"error":"invalid_request"}` |
 | 6 | `GET /walls/demo` | Exactly the same JSON values as step 4 |
+
+![The worked example step by step: an empty wall, then the 2 by 2 burst of energy 5, then the 1 by 1 burst of energy 2 on top of it](docs/images/worked-example.png)
+
+After step 4, the top-left 8 × 8 corner of the wall holds these values. Every cell outside it is 0.
+
+```text
+       x:  0  1  2  3  4  5  6  7
+  y=0      0  0  0  0  0  0  0  0
+  y=1      0  0  0  0  0  0  0  0
+  y=2      0  0  0  0  0  0  0  0
+  y=3      0  0  5  7  0  0  0  0      pixels[194]=5   pixels[195]=7
+  y=4      0  0  5  5  0  0  0  0      pixels[258]=5   pixels[259]=5
+  y=5      0  0  0  0  0  0  0  0
+  y=6      0  0  0  0  0  0  0  0
+  y=7      0  0  0  0  0  0  0  0
+```
 
 At step 4, pixels 194, 258, and 259 equal 5; pixel 195 equals 7; all other pixels equal 0.
 The sum of all pixel values is 22. The full expected JSON is supplied in `example_snapshot.json`.
@@ -265,4 +611,3 @@ Submit your source, the assistant transcript, and `NOTES.md` written by you: the
 dependencies, why you chose your stack, synchronization, the observed bottleneck, one
 optimization you measured, and which code the assistant wrote. Discuss larger walls or more clients afterward; you do not need to
 implement a distributed system.
-
